@@ -5589,3 +5589,110 @@ $72 = 0xfffff0025a10
 $73 = 0xfffff000aa30
 (gdb) p/x *(unsigned long *)($x19+0xe8)
 $74 = 0xfffff0000090
+
+
+Resumo técnico — investigação do parser H.264 e CedarX
+1. Objetivo
+Investigar o fluxo de leitura e parsing H.264 do CedarX no A733, especialmente o comportamento de supplyData(), RawParserPrefetch_H264() e a configuração de weighted prediction em libawh264.so.
+
+O teste foi realizado com o executável vdecoderdemo, utilizando um bitstream H.264 Annex B de 1280×720, codificado com weighted P-Frames (weightp=2).
+2. Bitstream utilizado
+Arquivo: /tmp/cedar-weighted.h264
+
+Características:
+- H.264 High Profile, Level 3.1.
+- Resolução: 1280×720.
+- Formato: YUV 4:2:0, 8 bits.
+- 120 frames: 1 I-frame e 119 P-frames.
+- Weighted P-Frames habilitado.
+- Sem B-frames.
+- Tamanho: 1.047.895 bytes (0xFFD57).
+O início do arquivo foi confirmado como:
+00 00 00 01 67 64 00 1F ...
+
+Interpretação:
+- 00 00 00 01: início de NAL Annex B.
+- 67: NAL type 7 — SPS.
+- 64: High Profile.
+- 1F: Level 3.1.
+3. Investigação de supplyData()
+Foi investigado o problema anterior de fread(NULL).
+
+O fluxo identificado foi:
+ChannelThread
+  └─ fopen("/tmp/cedar-weighted.h264")
+      └─ RawParserOpen(FILE *)
+          └─ supplyData()
+              └─ fread(buffer, 1, 0x400000, FILE *)
+
+Na execução atual, foi confirmado:
+Argumento	Valor
+Buffer (x0)	0xfffff6f8f010
+Tamanho do elemento (x1)	1
+Quantidade solicitada (x2)	0x400000
+FILE* (x3)	0xfffff0000b70
+
+
+O fread() retornou:
+w0 = 0xFFD57 = 1.047.895 bytes
+
+O código de supplyData() foi examinado em assembly:
+str w0, [sp, #32]
+ldr w0, [sp, #32]
+cmp w0, #0
+b.gt ...
+mov w0, #-1
+...
+ldr w0, [sp, #32]
+str w1, [x0, #32]
+str wzr, [x0, #24]
+
+Foi confirmado que o retorno positivo de fread() é armazenado em contexto+32, enquanto contexto+24 é zerado.
+
+Conclusão: nesta execução, a abertura do arquivo, a passagem do FILE *, a leitura e a atualização do contexto ocorreram corretamente. O antigo fread(NULL) não se reproduziu.
+4. Investigação de RawParserPrefetch_H264()
+Foi confirmada a utilização do buffer recebido:
+contexto+16 = 0xfffff6f8f010
+contexto+24 = 0
+
+O parser calculou o endereço de leitura como:
+ldr x1, [x0, #16]
+ldr w0, [x0, #24]
+sxtw x0, w0
+add x0, x1, x0
+
+O conteúdo inicial do buffer correspondeu ao SPS esperado.
+
+Também foi observada uma segunda chamada a supplyData(), originada de RawParserPrefetch_H264(). Naquele momento, o contexto apresentava:
+Offset	Valor	Interpretação
++24	0x000FF931	Posição de leitura
++28	0x00400000	Capacidade solicitada
++32	0x00000426	Quantidade de bytes restante
+
+
+Isso demonstra que o parser havia avançado praticamente até o final do primeiro bloco lido. A segunda chamada, portanto, é compatível com a necessidade de recarregar dados durante o parsing.
+
+Não foi demonstrada falha nessa segunda leitura.
+5. Weighted prediction
+Foi confirmado anteriormente que:
+H264DecodeSliceHeader()
+  └─ H264CongigureWeightTableRegisters()
+
+A rotina H264CongigureWeightTableRegisters() foi atingida durante o processamento de slices H.264.
+
+Na execução final, a pilha mostrou:
+DecodeThread
+  └─ DecodeVideoStream(bEndOfStream=1)
+      └─ VideoEngineDecode
+          └─ H264DecoderDecodeSbmFrame
+              └─ H264ProcessNaluUnit
+                  └─ H264DecodeSliceHeader
+                      └─ H264CongigureWeightTableRegisters
+
+Isso confirma que a rotina ARM responsável pela configuração de weighted prediction foi chamada no fluxo normal do decoder.
+
+Limitação: ainda não foi comprovado que os valores configurados foram efetivamente escritos nos registradores físicos do Video Engine (VE), nem que o hardware os utilizou na reconstrução dos pixels.
+
+Não consegui acionar a ferramenta de criação do arquivo Markdown neste momento. Portanto, não foi possível gerar uma nova versão para download.
+
+O resumo técnico acima registra as descobertas desta sessão. A documentação deverá ser atualizada quando a ferramenta estiver disponível novamente.
